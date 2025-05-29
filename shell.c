@@ -19,30 +19,36 @@
 
 job *tasks;
 
-void manejador(int signal) {
+// No es necesario bloquear la señal de SIGCHLD ya que al llamarse al manejador
+// se bloquean por el mismo SO, pero tampoco es algo que este mal
+void signal_handler(int signal) {
+  pid_t pid_wait;
   job *act_task;
   int status;
   int info;
-  int pid_wait = 0;
-  enum status status_res;
+  enum status task_status;
 
   block_SIGCHLD();
-  for (int i = 1; i <= list_size(tasks); i++) {
-    act_task = get_item_bypos(tasks, i);
-    pid_wait = waitpid(act_task->pgid, &status, WUNTRACED | WNOHANG);
-    if (pid_wait == act_task->pgid) {
-      status_res = analyze_status(status, &info);
 
-      if (status_res == SUSPENDED) {
-        printf("Command %s with PID %d, is SUSPENDED\n", act_task->command,
-               act_task->pgid);
-        act_task->state = SUSPENDED;
-      } else if (status_res == EXITED) {
-        printf("Command %s with PID %d, has EXITED\n", act_task->command,
-               act_task->pgid);
+  act_task = get_iterator(tasks);
+
+  while (act_task) {
+    pid_wait =
+        waitpid(act_task->pgid, &status, WUNTRACED | WNOHANG | WCONTINUED);
+    if (pid_wait == act_task->pgid) {
+      task_status = analyze_status(status, &info);
+      if ((task_status == EXITED) || (task_status == SIGNALED)) {
+        printf("Background job %s ended correctly\n", act_task->command);
         delete_job(tasks, act_task);
+      } else if ((task_status == CONTINUED)) {
+        printf("Stopped job %s launched\n", act_task->command);
+        act_task->state = BACKGROUND;
+      } else if ((task_status == SUSPENDED)) {
+        printf("Job %s, runnig at background stopped\n", act_task->command);
+        act_task->state = STOPPED;
       }
     }
+    next(act_task);
   }
   unblock_SIGCHLD();
 }
@@ -60,14 +66,18 @@ int main(void) {
   enum status status_res; /* Status processed by analyze_status() */
   int info;               /* Info processed by analyze_status() */
 
-  job *act_task;
-  int isForeground = 0;
-
   ignore_terminal_signals();
+  tasks = new_list("tasks");
+  signal(SIGCHLD, signal_handler);
 
-  signal(SIGCHLD, manejador);
+  job *act_task;
+  pid_t pid_fg;
+  char *fg_task_name;
 
-  tasks = new_list("tasks_list");
+  char *file_in = NULL;
+  char *file_out = NULL;
+  FILE *f_in = NULL;
+  FILE *f_out = NULL;
 
   while (
       1) /* Program terminates normally inside get_command() after ^D is typed*/
@@ -80,102 +90,70 @@ int main(void) {
     if (args[0] == NULL)
       continue; /* Do nothing if empty command */
 
-    // Built-In commands
-    if (strcmp(args[0], "cd") == 0) {
-      if (chdir(args[1]) == -1)
-        perror("No such file or directory");
+    if (!strcmp(args[0], "cd")) {
+      if (args[1] != NULL)
+        chdir(args[1]);
       continue;
     }
 
-    if (strcmp(args[0], "jobs") == 0) {
+    if (!strcmp(args[0], "jobs")) {
       block_SIGCHLD();
-      if (list_size(tasks) == 0)
-        printf("Jobs list is empty\n");
-      else
-        print_job_list(tasks);
+      print_job_list(tasks);
       unblock_SIGCHLD();
       continue;
     }
 
-    if (strcmp(args[0], "bg") == 0) {
-      block_SIGCHLD();
+    if (!strcmp(args[0], "bg")) {
       int pos = 1;
       if (args[1] != NULL)
         pos = atoi(args[1]);
+      block_SIGCHLD();
       act_task = get_item_bypos(tasks, pos);
-      unblock_SIGCHLD();
-      if ((act_task != NULL) && (act_task->state != STOPPED)) {
+      if (act_task) {
         act_task->state = BACKGROUND;
         killpg(act_task->pgid, SIGCONT);
       }
+      unblock_SIGCHLD();
       continue;
     }
 
-    if (strcmp(args[0], "fg") == 0) {
-      block_SIGCHLD();
+    if (!strcmp(args[0], "fg")) {
       int pos = 1;
       if (args[1] != NULL)
         pos = atoi(args[1]);
+      block_SIGCHLD();
       act_task = get_item_bypos(tasks, pos);
       unblock_SIGCHLD();
-      if (act_task != NULL) {
+      if (act_task) {
         set_terminal(act_task->pgid);
         if (act_task->state == STOPPED)
           killpg(act_task->pgid, SIGCONT);
-        isForeground = 1;
-        pid_fork = act_task->pgid;
+        pid_fg = act_task->pgid;
+        fg_task_name = strdup(act_task->command);
         block_SIGCHLD();
         delete_job(tasks, act_task);
+        act_task = NULL;
         unblock_SIGCHLD();
-      }else
-        continue;
-    }
-
-    if (strcmp(args[0], "logout") == 0)
-      exit(EXIT_SUCCESS);
-
-    // General structure
-    if (!isForeground)
-      pid_fork = fork();
-
-    if (pid_fork == -1) {
-      perror("Error at fork");
-      exit(EXIT_FAILURE);
-    }
-    if (pid_fork == 0) {
-      new_process_group(getpid());
-      if (!background)
-        set_terminal(getpid());
-      restore_terminal_signals();
-      execvp(args[0], args);
-      perror("Error executing command");
-      exit(EXIT_FAILURE);
-    } else {
-
-      if (background != 1) {
-        pid_wait = waitpid(pid_fork, &status, WUNTRACED);
+        pid_wait = waitpid(pid_fg, &status, WUNTRACED);
         set_terminal(getpid());
         status_res = analyze_status(status, &info);
         if (status_res == SUSPENDED) {
           block_SIGCHLD();
-          add_job(tasks, new_job(pid_fork, args[0], STOPPED));
+          add_job(tasks, new_job(pid_fg, fg_task_name, STOPPED));
           unblock_SIGCHLD();
-          printf("Foreground pid: %d, command: %s, %s, info: %d\n", pid_fork,
-                 args[0], status_strings[status_res], info);
+          free(fg_task_name);
+          printf("Suspended job added\n");
         } else if (status_res == EXITED) {
-          if (info != 255) {
-            printf("Foreground pid: %d, command: %s, %s, info: %d\n", pid_fork,
-                   args[0], status_strings[status_res], info);
-          }
+          printf("Foreground pid: %d, command: %s, %s, info: %d\n", pid_fg,
+                 fg_task_name, status_strings[status_res], info);
+          free(fg_task_name);
         }
-      } else {
-        block_SIGCHLD();
-        add_job(tasks, new_job(pid_fork, args[0], BACKGROUND));
-        unblock_SIGCHLD();
-        printf("Background pid: %d\n", pid_fork);
       }
-      isForeground = 0;
+      continue;
     }
+
+    if (!strcmp(args[0], "exit"))
+      exit(EXIT_SUCCESS);
 
     /** The steps are:
      *	 (1) Fork a child process using fork()
@@ -184,6 +162,80 @@ int main(void) {
      *	 (4) Shell shows a status message for processed command
      * 	 (5) Loop returns to get_commnad() function
      **/
+
+    parse_redirections(args, &file_in, &file_out);
+
+    pid_fork = fork();
+
+    if (pid_fork == -1) {
+      // Error
+      perror("Error at fork");
+      exit(EXIT_FAILURE);
+    } else if (pid_fork == 0) {
+      // Child
+      if (file_out) {
+        f_out = fopen(file_out, "w");
+        if (!f_out) {
+          perror("Error opening out file\n");
+          exit(EXIT_FAILURE);
+        }
+        int fd_out = fileno(f_out);
+        dup2(fd_out, STDOUT_FILENO);
+        close(fd_out);
+      }
+      if (file_in) {
+        f_in = fopen(file_in, "r");
+        if (!f_in) {
+          perror("Error opening in file\n");
+          exit(EXIT_FAILURE);
+        }
+        int fd_in = fileno(f_in);
+        dup2(fd_in, STDIN_FILENO);
+        close(fd_in);
+      }
+      new_process_group(getpid());
+      if (!background)
+        set_terminal(getpid());
+      restore_terminal_signals();
+      execvp(args[0], args);
+      perror("Error executing command");
+      exit(EXIT_FAILURE);
+    } else {
+      // Parent
+
+      // Aunque hagamos esto mismo en el child, no sabemos que proceso se
+      // ejecutara antes (y es 100% necesario asinarlo al mismo grupo) por el
+      // compilador por lo que, aunque redundante es mejor incluirlo pues da
+      // mayor seguridad.
+      new_process_group(pid_fork);
+      if (!background) {
+        // Parent + background
+        set_terminal(pid_fork);
+
+        pid_wait = waitpid(pid_fork, &status, WUNTRACED);
+        set_terminal(getpid());
+
+        if (pid_wait == pid_fork) {
+          status_res = analyze_status(status, &info);
+          if (status_res == SUSPENDED) {
+            block_SIGCHLD();
+            add_job(tasks, new_job(pid_fork, args[0], STOPPED));
+            unblock_SIGCHLD();
+            printf("Suspended job added\n");
+          }
+          printf("Foreground pid: %d, command: %s, %s, info: %d\n", pid_fork,
+                 args[0], status_strings[status_res], info);
+        }
+
+      } else {
+        // Parent without background
+        block_SIGCHLD();
+        add_job(tasks, new_job(pid_fork, args[0], BACKGROUND));
+        unblock_SIGCHLD();
+        printf("Background job running... pid: %d, command: %s\n", pid_fork,
+               args[0]);
+      }
+    }
 
   } /* End while */
 }
