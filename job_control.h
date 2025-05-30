@@ -16,6 +16,7 @@
 // compilador GCC, por eso incluimos esta define
 #define _GNU_SOURCE
 
+#include <dirent.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,7 +24,6 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
-
 
 /**
  * Enumerations
@@ -40,6 +40,8 @@ typedef struct job_ {
   char *command; /* Program name */
   enum job_state state;
   struct job_ *next; /* Next job in the list */
+  int inmortal;
+  char **comm_args;
 } job;
 
 /* Type for job list iterator */
