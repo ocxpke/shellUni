@@ -21,6 +21,11 @@
 
 job *tasks;
 
+pid_t pidAlarmSig;
+time_t global_time;
+int timeSignalGlobal;
+
+// Allocate args to insert in the job struxter in need of relaunching jobs
 char **cpy_args(char **args) {
   int len = 0;
   while (args[len])
@@ -37,6 +42,7 @@ char **cpy_args(char **args) {
   return (ret);
 }
 
+// Free resources for allocated **char
 void free_pp_char(char **args) {
   for (int i = 0; args[i]; i++) {
     free(args[i]);
@@ -44,6 +50,7 @@ void free_pp_char(char **args) {
   free(args);
 }
 
+// If the job is inmortal we will relauunch it in background mode
 void relaunch(job *rela_job) {
   pid_t pid_fork = fork();
   job *new_task;
@@ -62,6 +69,12 @@ void relaunch(job *rela_job) {
     new_task = new_job(pid_fork, rela_job->comm_args[0], BACKGROUND);
     new_task->inmortal = 1;
     new_task->comm_args = cpy_args(rela_job->comm_args);
+    new_task->threadWait = NULL;
+    new_task->isProcWait = 0;
+    new_task->pid_wait = -1;
+    new_task->isAlarmSig = 0;
+    new_task->timeAlarmSig = 0;
+    new_task->initTime = 0;
     add_job(tasks, new_task);
   }
 }
@@ -90,6 +103,13 @@ void signal_handler(int signal) {
           print_item(act_task);
           relaunch(act_task);
         }
+        if (act_task->threadWait) {
+          pthread_cancel(*(act_task->threadWait));
+        }
+        if (act_task->isProcWait) {
+          kill(act_task->pid_wait, SIGKILL);
+          waitpid(act_task->pid_wait, NULL, WUNTRACED);
+        }
         free_pp_char(act_task->comm_args);
         delete_job(tasks, act_task);
       } else if ((task_status == CONTINUED)) {
@@ -105,6 +125,7 @@ void signal_handler(int signal) {
   unblock_SIGCHLD();
 }
 
+// Sighup handler
 void sighup_handler(int signal) {
   FILE *fp;
   fp = fopen("hup.txt", "a");
@@ -114,7 +135,30 @@ void sighup_handler(int signal) {
   }
 }
 
-// Append
+void sigalrm_handler(int signal) {
+  if (pidAlarmSig > 0) {
+    if ((time(NULL) - global_time) >= timeSignalGlobal) {
+      kill(pidAlarmSig, SIGCONT);
+      kill(pidAlarmSig, SIGKILL);
+    }
+  }
+  block_SIGCHLD();
+  printf("ALARMAAAAA\n");
+  job *act_task = get_iterator(tasks);
+  while (act_task) {
+    if (act_task->isAlarmSig) {
+      printf("-->%ld\n", act_task->initTime);
+      if ((time(NULL) - act_task->initTime) >= act_task->timeAlarmSig) {
+        kill(act_task->pgid, SIGCONT);
+        kill(act_task->pgid, SIGKILL);
+      }
+    }
+    next(act_task);
+  }
+  unblock_SIGCHLD();
+}
+
+// Check if we need to append and on that case organize args
 int check_if_append(char **args, char **file_out) {
   for (int i = 0; args[i]; i++) {
     if (!strcmp(args[i], ">>")) {
@@ -136,6 +180,7 @@ int check_if_append(char **args, char **file_out) {
   return (0);
 }
 
+// Check if we have "+" character
 int is_inmortal(char **args) {
   for (int i = 0; args[i]; i++) {
     if (!strcmp(args[i], "+")) {
@@ -146,6 +191,7 @@ int is_inmortal(char **args) {
   return (0);
 }
 
+// Check if the argument for blocking signals has init keyword and end flag
 int is_block_mask(char **args) {
   if (!strcmp(args[0], "mask")) {
     for (int i = 1; args[i]; i++) {
@@ -156,6 +202,9 @@ int is_block_mask(char **args) {
   return (0);
 }
 
+// Here we are sure taht the argumet to block signals is correct and procceed to
+// block signals, there is a function to do this so there was no need to replay
+// this function
 void block_signals_mask(char **args, sigset_t *signals_set) {
   printf("holaaaaa\n");
   int i = 1;
@@ -180,6 +229,30 @@ void block_signals_mask(char **args, sigset_t *signals_set) {
     printf("%s\n", args[w]);
 }
 
+// Copy what we read into inputBuff to analyze the command
+// NECESSARY TO END WITH /n
+void clone_into_buff(char *input, char inputBuff[]) {
+  int len = strlen(input);
+  if (len > MAX_LINE)
+    len = MAX_LINE;
+  for (int i = 0; i < len; i++) {
+    inputBuff[i] = input[i];
+  }
+  inputBuff[len] = '\n';
+}
+
+void *thread_job(void *arg) {
+  waitThread_t *argThreadJ = (waitThread_t *)arg;
+
+  sleep(argThreadJ->wait);
+
+  kill(argThreadJ->pid, SIGCONT);
+  kill(argThreadJ->pid, SIGKILL);
+
+  free(argThreadJ);
+  pthread_exit(NULL);
+}
+
 /**
  * MAIN
  **/
@@ -193,9 +266,14 @@ int main(void) {
   enum status status_res; /* Status processed by analyze_status() */
   int info;               /* Info processed by analyze_status() */
 
+  // Our shell must ignore signals
   ignore_terminal_signals();
+  // we create our new task list
   tasks = new_list("tasks");
+  // how me manage when we receive SIGCHLD
   signal(SIGCHLD, signal_handler);
+  // manage alarm signal
+  signal(SIGALRM, sigalrm_handler);
 
   // Fg, Bg and jobs
   job *act_task;
@@ -214,18 +292,67 @@ int main(void) {
   // Append >>
   int append = 0;
 
+  // Inmortal
   int inmortal = 0;
+
+  // History
+  char *entry;
+
+  // Alarm-Thread
+  int isThread;
+  int timeThread;
+  pthread_t *threadWait;
+  waitThread_t *argThread = NULL;
+
+  // Alarm-Proc
+  int isProcWait;
+  int timeProc;
+  pid_t pidAlarmProc;
+
+  // Alarm-Signal
+  time_t initTime;
+  int isAlarmSig;
+  int timeAlarmSig;
 
   while (
       1) /* Program terminates normally inside get_command() after ^D is typed*/
   {
+    entry = readline("COMMAND->");
+
+    /*
     printf("COMMAND->");
     fflush(stdout);
+    */
+
+    if ((entry != NULL) && entry[0] == '!') {
+      int num = atoi(&entry[1]);
+      if (num > 0) {
+        HIST_ENTRY **hist_search = history_list();
+        int i = 0;
+        while ((i < (num - 1)) && hist_search[i]) {
+          i++;
+        }
+        if ((i == (num - 1)) && hist_search[i]) {
+          free(entry);
+          entry = strdup(hist_search[i]->line);
+        }
+      }
+    }
+
+    bzero(inputBuffer, MAX_LINE);
+    if (entry == NULL)
+      inputBuffer[0] = 0;
+    else
+      clone_into_buff(entry, inputBuffer);
+
     get_command(inputBuffer, MAX_LINE, args,
                 &background); /* Get next command */
 
     if (args[0] == NULL)
       continue; /* Do nothing if empty command */
+
+    add_history(entry);
+    free(entry);
 
     if (!strcmp(args[0], "cd")) {
       if (args[1] != NULL)
@@ -256,6 +383,7 @@ int main(void) {
 
     if (!strcmp(args[0], "fg")) {
       int pos = 1;
+      pthread_t *threadFG;
       if (args[1] != NULL)
         pos = atoi(args[1]);
       block_SIGCHLD();
@@ -267,6 +395,12 @@ int main(void) {
           killpg(act_task->pgid, SIGCONT);
         pid_fg = act_task->pgid;
         fg_task_name = strdup(act_task->command);
+        threadFG = act_task->threadWait;
+        isProcWait = act_task->isProcWait;
+        pidAlarmProc = act_task->pid_wait;
+        isAlarmSig = act_task->isAlarmSig;
+        timeAlarmSig = act_task->timeAlarmSig;
+        initTime = act_task->initTime;
         block_SIGCHLD();
         free_pp_char(act_task->comm_args);
         delete_job(tasks, act_task);
@@ -280,11 +414,19 @@ int main(void) {
           act_task = new_job(pid_fg, fg_task_name, STOPPED);
           act_task->inmortal = 0;
           act_task->comm_args = cpy_args(args);
+          act_task->threadWait = threadFG;
+          act_task->isProcWait = isProcWait;
+          act_task->pid_wait = pidAlarmProc;
+          act_task->isAlarmSig = isAlarmSig;
+          act_task->timeAlarmSig = timeAlarmSig;
+          act_task->initTime = initTime;
           add_job(tasks, act_task);
           unblock_SIGCHLD();
           free(fg_task_name);
           printf("Suspended job added\n");
-        } else if (status_res == EXITED) {
+        } else if (status_res == EXITED || /*new*/ status_res == EXITED) {
+          if (threadFG)
+            pthread_cancel(*threadFG);
           printf("Foreground pid: %d, command: %s, %s, info: %d\n", pid_fg,
                  fg_task_name, status_strings[status_res], info);
           free(fg_task_name);
@@ -350,7 +492,7 @@ int main(void) {
             // La siguiente línea lee pid, state y ppid de /proc/<pid>/stat
             fscanf(fd, "%ld %s %c %ld", &z_pid, buff, &z_state, &z_ppid);
             if ((z_state == 'Z') && (getpid() == z_ppid)) {
-              printf("%d\n", z_pid);
+              printf("%ld\n", z_pid);
               pid_wait = waitpid(z_pid, &status, WUNTRACED);
               status_res = analyze_status(status, &info);
               /*
@@ -390,11 +532,83 @@ int main(void) {
           act_task = new_job(pid_fork, args[2], BACKGROUND);
           act_task->inmortal = 0;
           act_task->comm_args = cpy_args(args);
+          act_task->threadWait = NULL;
+          act_task->isProcWait = 0;
+          act_task->pid_wait = -1;
+          act_task->isAlarmSig = 0;
+          act_task->timeAlarmSig = 0;
+          act_task->initTime = 0;
           add_job(tasks, act_task);
           unblock_SIGCHLD();
         }
       }
       continue;
+    }
+
+    if (!strcmp(args[0], "histclean")) {
+      clear_history();
+      continue;
+    }
+
+    if (!strcmp(args[0], "hist")) {
+      HIST_ENTRY **hist = history_list();
+      for (int i = 0; hist[i]; i++) {
+        printf("%d %s\n", i + 1, hist[i]->line);
+      }
+      continue;
+    }
+
+    isThread = 0;
+    timeThread = 0;
+    threadWait = NULL;
+    if (!strcmp(args[0], "alarm-thread")) {
+      timeThread = atoi(args[1]);
+      if (timeThread <= 0)
+        continue;
+      isThread = 1;
+      int i = 0;
+      char *tmp;
+      while (args[i + 2]) {
+        tmp = args[i + 2];
+        args[i] = tmp;
+        i++;
+      }
+      args[i] = NULL;
+    }
+
+    isProcWait = 0;
+    pidAlarmProc = 0;
+    if (!strcmp(args[0], "alarm-proc")) {
+      timeProc = atoi(args[1]);
+      if (timeProc <= 0)
+        continue;
+      isProcWait = 1;
+      int i = 0;
+      char *tmp;
+      while (args[i + 2]) {
+        tmp = args[i + 2];
+        args[i] = tmp;
+        i++;
+      }
+      args[i] = NULL;
+    }
+
+    isAlarmSig = 0;
+    timeAlarmSig = 0;
+    if (!strcmp(args[0], "alarm-signal")) {
+      timeAlarmSig = atoi(args[1]);
+      if (timeAlarmSig <= 0)
+        continue;
+      timeSignalGlobal = timeAlarmSig;
+      isAlarmSig = 1;
+      int i = 0;
+      char *tmp;
+      while (args[i + 2]) {
+        tmp = args[i + 2];
+        args[i] = tmp;
+        i++;
+      }
+      args[i] = NULL;
     }
 
     if (!strcmp(args[0], "exit"))
@@ -419,7 +633,23 @@ int main(void) {
 
     sigset_t signals_set;
 
+    pidAlarmSig = 0;
+
     pid_fork = fork();
+
+    if ((pid_fork > 0) && isProcWait) {
+      pidAlarmProc = fork();
+      if (pidAlarmProc == 0) {
+        new_process_group(getpid());
+        restore_terminal_signals();
+        sleep(timeProc);
+        kill(pid_fork, SIGCONT);
+        kill(pid_fork, SIGKILL);
+        exit(EXIT_SUCCESS);
+      } else if (pidAlarmProc > 0) {
+        new_process_group(pidAlarmProc);
+      }
+    }
 
     if (pid_fork == -1) {
       // Error
@@ -466,6 +696,11 @@ int main(void) {
         args[0] = "./cuentafich.sh";
       execvp(args[0], args);
       perror("Error executing command");
+      if (isProcWait) {
+        kill(pidAlarmProc, SIGKILL);
+        waitpid(pidAlarmProc, NULL, WUNTRACED);
+      }
+
       exit(EXIT_FAILURE);
     } else {
       // Parent
@@ -475,23 +710,56 @@ int main(void) {
       // compilador por lo que, aunque redundante es mejor incluirlo pues da
       // mayor seguridad.
       new_process_group(pid_fork);
+
+      if (isThread) {
+        threadWait = (pthread_t *)malloc(sizeof(pthread_t));
+        argThread = (waitThread_t *)malloc(sizeof(waitThread_t));
+        argThread->pid = pid_fork;
+        argThread->wait = timeThread;
+        pthread_create(threadWait, NULL, thread_job, argThread);
+        pthread_detach(*threadWait);
+      }
+
+      if (isAlarmSig) {
+        time(&initTime);
+        global_time = initTime;
+        alarm(timeAlarmSig);
+      }
+
       if (!background && !inmortal) {
         // Parent + no background
         set_terminal(pid_fork);
 
+        pidAlarmSig = pid_fork;
         pid_wait = waitpid(pid_fork, &status, WUNTRACED);
         set_terminal(getpid());
 
         if (pid_wait == pid_fork) {
           status_res = analyze_status(status, &info);
           if (status_res == SUSPENDED) {
+            pidAlarmSig = 0;
             block_SIGCHLD();
             act_task = new_job(pid_fork, args[0], STOPPED);
             act_task->inmortal = 0;
             act_task->comm_args = cpy_args(args);
+            act_task->threadWait = NULL;
+            if (isThread)
+              act_task->threadWait = threadWait;
+            act_task->isProcWait = isProcWait;
+            act_task->pid_wait = pidAlarmProc;
+            act_task->isAlarmSig = isAlarmSig;
+            act_task->timeAlarmSig = timeAlarmSig;
+            act_task->initTime = initTime;
             add_job(tasks, act_task);
             unblock_SIGCHLD();
             printf("Suspended job added\n");
+          }
+          if ((status_res != SUSPENDED) && isThread) {
+            pthread_cancel(*threadWait);
+          }
+          if ((status_res != SUSPENDED) && isProcWait) {
+            kill(pidAlarmProc, SIGKILL);
+            waitpid(pidAlarmProc, NULL, WUNTRACED);
           }
           printf("Foreground pid: %d, command: %s, %s, info: %d\n", pid_fork,
                  args[0], status_strings[status_res], info);
@@ -503,6 +771,14 @@ int main(void) {
         act_task = new_job(pid_fork, args[0], BACKGROUND);
         act_task->inmortal = inmortal;
         act_task->comm_args = cpy_args(args);
+        act_task->threadWait = NULL;
+        if (isThread)
+          act_task->threadWait = threadWait;
+        act_task->isProcWait = isProcWait;
+        act_task->pid_wait = pidAlarmProc;
+        act_task->isAlarmSig = isAlarmSig;
+        act_task->timeAlarmSig = timeAlarmSig;
+        act_task->initTime = initTime;
         add_job(tasks, act_task);
         unblock_SIGCHLD();
         printf("Background job running... pid: %d, command: %s\n", pid_fork,

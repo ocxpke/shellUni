@@ -1,8 +1,8 @@
 COMPILER = gcc
 
-NAME = shell
+NAME = a.out
 
-FLAGS = -g
+FLAGS = -std=gnu99 -g
 
 SRC = shell.c job_control.c
 
@@ -11,7 +11,7 @@ OBJS = $(SRC:.c=.o)
 all: $(NAME)
 
 $(NAME): $(OBJS)
-	$(COMPILER) $(FLAGS) $(OBJS) -o $(NAME)
+	$(COMPILER) $(FLAGS) $(OBJS) -pthread -lreadline -o $(NAME)
 
 %.o: %.c
 	$(COMPILER) $(FLAGS) -o $@ -c $<

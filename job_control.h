@@ -17,6 +17,7 @@
 #define _GNU_SOURCE
 
 #include <dirent.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +25,9 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
+
+#include <readline/history.h>
+#include <readline/readline.h>
 
 /**
  * Enumerations
@@ -34,6 +38,11 @@ static char *status_strings[] = {"Suspended", "Signaled", "Exited",
                                  "Continued"};
 static char *state_strings[] = {"Foreground", "Background", "Stopped"};
 
+typedef struct waitThread_s {
+  int wait;
+  pid_t pid;
+} waitThread_t;
+
 /* Job type for job list */
 typedef struct job_ {
   pid_t pgid;    /* Group id = process lider id */
@@ -42,6 +51,12 @@ typedef struct job_ {
   struct job_ *next; /* Next job in the list */
   int inmortal;
   char **comm_args;
+  pthread_t *threadWait;
+  int isProcWait;
+  pid_t pid_wait;
+  int isAlarmSig;
+  int timeAlarmSig;
+  time_t initTime;
 } job;
 
 /* Type for job list iterator */

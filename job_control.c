@@ -26,11 +26,13 @@ void get_command(char inputBuffer[], int size, char *args[], int *background) {
   *background = 0;
 
   /* Read what the user enters on the command line */
-  length = read(STDIN_FILENO, inputBuffer, size);
+  //length = read(STDIN_FILENO, inputBuffer, size);
+
+  length = strlen(inputBuffer);
 
   start = -1;
   if (length == 0) {
-    printf("\nBye\n");
+    printf("Bye\n");
     exit(0); /* ^d was entered, end of user command stream */
   }
   if (length < 0) {
