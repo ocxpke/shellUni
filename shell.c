@@ -21,6 +21,8 @@
 
 job *tasks;
 
+// Variables globales para alarm signal pues solo puede haber un comando en
+// foreground a la vez
 pid_t pidAlarmSig;
 time_t global_time;
 int timeSignalGlobal;
@@ -135,19 +137,20 @@ void sighup_handler(int signal) {
   }
 }
 
+// Sigalrm handler
 void sigalrm_handler(int signal) {
+  // Chequeamos el de foreground
   if (pidAlarmSig > 0) {
     if ((time(NULL) - global_time) >= timeSignalGlobal) {
       kill(pidAlarmSig, SIGCONT);
       kill(pidAlarmSig, SIGKILL);
     }
   }
+  // Comprobamos los que esten en bg o suspended
   block_SIGCHLD();
-  printf("ALARMAAAAA\n");
   job *act_task = get_iterator(tasks);
   while (act_task) {
     if (act_task->isAlarmSig) {
-      printf("-->%ld\n", act_task->initTime);
       if ((time(NULL) - act_task->initTime) >= act_task->timeAlarmSig) {
         kill(act_task->pgid, SIGCONT);
         kill(act_task->pgid, SIGKILL);
@@ -202,11 +205,10 @@ int is_block_mask(char **args) {
   return (0);
 }
 
-// Here we are sure taht the argumet to block signals is correct and procceed to
+// Here we are sure that the argumet to block signals is correct and procceed to
 // block signals, there is a function to do this so there was no need to replay
 // this function
 void block_signals_mask(char **args, sigset_t *signals_set) {
-  printf("holaaaaa\n");
   int i = 1;
   sigemptyset(signals_set);
   while (strcmp(args[i], "-c")) {
@@ -224,9 +226,6 @@ void block_signals_mask(char **args, sigset_t *signals_set) {
     z++;
   }
   args[z] = NULL;
-
-  for (int w = 0; args[w]; w++)
-    printf("%s\n", args[w]);
 }
 
 // Copy what we read into inputBuff to analyze the command
@@ -241,6 +240,7 @@ void clone_into_buff(char *input, char inputBuff[]) {
   inputBuff[len] = '\n';
 }
 
+// Function that will exec our alarm-thread
 void *thread_job(void *arg) {
   waitThread_t *argThreadJ = (waitThread_t *)arg;
 
@@ -317,6 +317,7 @@ int main(void) {
   while (
       1) /* Program terminates normally inside get_command() after ^D is typed*/
   {
+    // Con la libreral de readline implementamos el historial
     entry = readline("COMMAND->");
 
     /*
@@ -324,6 +325,7 @@ int main(void) {
     fflush(stdout);
     */
 
+    // Para ejecutar la instruccion del historial
     if ((entry != NULL) && entry[0] == '!') {
       int num = atoi(&entry[1]);
       if (num > 0) {
@@ -339,27 +341,34 @@ int main(void) {
       }
     }
 
+    // Vaciamos lo que haya en  input buffer
     bzero(inputBuffer, MAX_LINE);
+    // Si el usuario ha usado ^D se acaba, sino clonamos
     if (entry == NULL)
       inputBuffer[0] = 0;
     else
       clone_into_buff(entry, inputBuffer);
 
+    // Parseo de lo introducido por el usuario
     get_command(inputBuffer, MAX_LINE, args,
                 &background); /* Get next command */
 
+    // Texto vacio == continuar
     if (args[0] == NULL)
       continue; /* Do nothing if empty command */
 
+    // Se añade la entrada al historial y se borra
     add_history(entry);
     free(entry);
 
+    // Cd built-in
     if (!strcmp(args[0], "cd")) {
       if (args[1] != NULL)
         chdir(args[1]);
       continue;
     }
 
+    // Prints the jobs suspended and bg list
     if (!strcmp(args[0], "jobs")) {
       block_SIGCHLD();
       print_job_list(tasks);
@@ -367,6 +376,7 @@ int main(void) {
       continue;
     }
 
+    // Changes suspended job to run in background
     if (!strcmp(args[0], "bg")) {
       int pos = 1;
       if (args[1] != NULL)
@@ -381,6 +391,7 @@ int main(void) {
       continue;
     }
 
+    // Changes a suspended, or a background job to run in foreground
     if (!strcmp(args[0], "fg")) {
       int pos = 1;
       pthread_t *threadFG;
@@ -406,10 +417,17 @@ int main(void) {
         delete_job(tasks, act_task);
         act_task = NULL;
         unblock_SIGCHLD();
+
+        pidAlarmSig = pidAlarmProc;
+        global_time = initTime;
+        timeSignalGlobal = timeAlarmSig;
+
         pid_wait = waitpid(pid_fg, &status, WUNTRACED);
         set_terminal(getpid());
         status_res = analyze_status(status, &info);
+
         if (status_res == SUSPENDED) {
+          pidAlarmSig = 0;
           block_SIGCHLD();
           act_task = new_job(pid_fg, fg_task_name, STOPPED);
           act_task->inmortal = 0;
@@ -435,7 +453,7 @@ int main(void) {
       continue;
     }
 
-    // currjob
+    // Currjob --> prints the first job of the list
     if (!strcmp(args[0], "currjob")) {
       act_task = get_item_bypos(tasks, 1);
       if (!act_task)
@@ -447,7 +465,7 @@ int main(void) {
       continue;
     }
 
-    // deljob
+    // Deljob deletes a job from the job list --> this leads to zombie jobs
     if (!strcmp(args[0], "deljob")) {
       block_SIGCHLD();
       act_task = get_item_bypos(tasks, 1);
@@ -472,7 +490,7 @@ int main(void) {
       continue;
     }
 
-    // zjobs
+    // zjobs --> cleans all zombie jobs made by deljob
     if (!strcmp(args[0], "zjobs")) {
       block_SIGCHLD();
       DIR *d;
@@ -508,7 +526,7 @@ int main(void) {
       continue;
     }
 
-    // bgteam
+    // bgteam --> executes n times a command in backgorund mode
     if (!strcmp(args[0], "bgteam")) {
       if ((args[1] == NULL) || (args[2] == NULL)) {
         printf("El comando bgteam requiere dos argumentos\n");
@@ -545,11 +563,13 @@ int main(void) {
       continue;
     }
 
+    // Cleans history command
     if (!strcmp(args[0], "histclean")) {
       clear_history();
       continue;
     }
 
+    // Shows all commands executed by user
     if (!strcmp(args[0], "hist")) {
       HIST_ENTRY **hist = history_list();
       for (int i = 0; hist[i]; i++) {
@@ -558,9 +578,11 @@ int main(void) {
       continue;
     }
 
+    // Set to 0 / null var needed by alarm-thread
     isThread = 0;
     timeThread = 0;
     threadWait = NULL;
+    // Set needed info by alarm-thread
     if (!strcmp(args[0], "alarm-thread")) {
       timeThread = atoi(args[1]);
       if (timeThread <= 0)
@@ -576,8 +598,10 @@ int main(void) {
       args[i] = NULL;
     }
 
+    // Set to 0 / null var needed by alarm-proc
     isProcWait = 0;
     pidAlarmProc = 0;
+    // Set needed info by alarm-proc
     if (!strcmp(args[0], "alarm-proc")) {
       timeProc = atoi(args[1]);
       if (timeProc <= 0)
@@ -593,8 +617,10 @@ int main(void) {
       args[i] = NULL;
     }
 
+    // Set to 0 / null var needed by alarm-signal
     isAlarmSig = 0;
     timeAlarmSig = 0;
+    // Set needed info by alarm-signal
     if (!strcmp(args[0], "alarm-signal")) {
       timeAlarmSig = atoi(args[1]);
       if (timeAlarmSig <= 0)
@@ -611,6 +637,53 @@ int main(void) {
       args[i] = NULL;
     }
 
+    // Variables needed for mydeamon
+    pid_t pid_sub_fork = 0;
+    FILE *f_null;
+    int finum_null;
+
+    // Doble fork because we need a "nieto" so child needs to create another
+    // child and the die the systemd will be the father of our daemon
+    if (!strcmp(args[0], "mydaemon")) {
+      pid_fork = fork();
+
+      if (pid_fork == 0) {
+        new_process_group(getpid());
+        restore_terminal_signals();
+        pid_sub_fork = fork();
+        if (pid_sub_fork == 0) {
+          printf("Deamon pid: %d\n", getpid());
+
+          new_process_group(getpid());
+          block_signal(SIGHUP, 1);
+
+          f_null = fopen("/dev/null", "r+");
+          if (!f_null) {
+            perror("Error en deamon");
+            continue;
+          }
+
+          finum_null = fileno(f_null);
+          dup2(finum_null, STDIN_FILENO);
+          dup2(finum_null, STDOUT_FILENO);
+          dup2(finum_null, STDERR_FILENO);
+
+          execvp(args[1], &args[1]);
+          perror("Error executing command");
+          exit(EXIT_FAILURE);
+        } else {
+          new_process_group(pid_sub_fork);
+          exit(EXIT_SUCCESS);
+        }
+      } else {
+        new_process_group(pid_fork);
+        waitpid(pid_fork, &status, WUNTRACED);
+      }
+
+      continue;
+    }
+
+    // Exit function
     if (!strcmp(args[0], "exit"))
       exit(EXIT_SUCCESS);
 
@@ -622,21 +695,27 @@ int main(void) {
      * 	 (5) Loop returns to get_commnad() function
      **/
 
+    // We detect if we have to redirect outputs or inputs
     parse_redirections(args, &file_in, &file_out);
 
     append = check_if_append(args, &file_out);
     if (append == -1)
       continue;
 
+    // Initialize varibale used for inmortal commands
     inmortal = 0;
     inmortal = is_inmortal(args);
 
+    // Set to use for blocking signals
     sigset_t signals_set;
 
+    // Initialize variables for alarm-signal
     pidAlarmSig = 0;
 
     pid_fork = fork();
 
+    // In alarm-proc we need pid of child and pid of the process that will kill
+    // child
     if ((pid_fork > 0) && isProcWait) {
       pidAlarmProc = fork();
       if (pidAlarmProc == 0) {
@@ -658,9 +737,11 @@ int main(void) {
     } else if (pid_fork == 0) {
       // Child
 
+      // Block signals received by user
       if (is_block_mask(args))
         block_signals_mask(args, &signals_set);
 
+      // Redirect file out
       if (file_out) {
         if (append)
           f_out = fopen(file_out, "a");
@@ -676,6 +757,8 @@ int main(void) {
         f_out = NULL;
         close(fd_out);
       }
+
+      // Redirect file in
       if (file_in) {
         f_in = fopen(file_in, "r");
         if (!f_in) {
@@ -688,14 +771,19 @@ int main(void) {
         f_in = NULL;
         close(fd_in);
       }
+
       new_process_group(getpid());
       if (!background && !inmortal)
         set_terminal(getpid());
       restore_terminal_signals();
+
+      // Built in command to execute bash script
       if (!strcmp(args[0], "fico"))
         args[0] = "./cuentafich.sh";
       execvp(args[0], args);
       perror("Error executing command");
+
+      // Kill alarm process if something goes wrong
       if (isProcWait) {
         kill(pidAlarmProc, SIGKILL);
         waitpid(pidAlarmProc, NULL, WUNTRACED);
@@ -711,6 +799,7 @@ int main(void) {
       // mayor seguridad.
       new_process_group(pid_fork);
 
+      // In case of alarm-thread create a new thread + arguments for every case
       if (isThread) {
         threadWait = (pthread_t *)malloc(sizeof(pthread_t));
         argThread = (waitThread_t *)malloc(sizeof(waitThread_t));
@@ -720,6 +809,7 @@ int main(void) {
         pthread_detach(*threadWait);
       }
 
+      // Set needed data for alarm-signal case
       if (isAlarmSig) {
         time(&initTime);
         global_time = initTime;
@@ -754,13 +844,18 @@ int main(void) {
             unblock_SIGCHLD();
             printf("Suspended job added\n");
           }
+
+          // Kill thread (ALARM-THREAD) if proccess has died on fg
           if ((status_res != SUSPENDED) && isThread) {
             pthread_cancel(*threadWait);
           }
+
+          // Kill process (ALARM-PROC) if proccess has died on fg
           if ((status_res != SUSPENDED) && isProcWait) {
             kill(pidAlarmProc, SIGKILL);
             waitpid(pidAlarmProc, NULL, WUNTRACED);
           }
+
           printf("Foreground pid: %d, command: %s, %s, info: %d\n", pid_fork,
                  args[0], status_strings[status_res], info);
         }
